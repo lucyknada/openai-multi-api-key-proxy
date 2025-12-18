@@ -1,0 +1,17 @@
+services:
+  vllm-multi-key-proxy:
+    build: .
+    container_name: vllm-multi-key-proxy
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-http://localhost:8000}
+      - ALLOWED_KEYS_FILE=/app/allowed_api_keys.txt
+      - DEFAULT_TIMEOUT_MS=600000
+      - VERBOSE=${VERBOSE:-false}
+    volumes:
+      - ./allowed_api_keys.txt:/app/allowed_api_keys.txt:ro
+    restart: always
+
