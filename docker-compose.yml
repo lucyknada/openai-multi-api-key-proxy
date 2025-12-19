@@ -11,7 +11,9 @@ services:
       - ALLOWED_KEYS_FILE=/app/allowed_api_keys.txt
       - DEFAULT_TIMEOUT_MS=600000
       - VERBOSE=${VERBOSE:-false}
+      - LOG_FILE=/app/logs/logs.jsonl
     volumes:
       - ./allowed_api_keys.txt:/app/allowed_api_keys.txt:ro
+      - ./logs:/app/logs
     restart: always
 

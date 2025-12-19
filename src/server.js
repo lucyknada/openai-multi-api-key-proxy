@@ -5,6 +5,7 @@ const cors = require('cors');
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -12,6 +13,19 @@ const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || 'http://localhost:8000';
 const ALLOWED_KEYS_FILE = process.env.ALLOWED_KEYS_FILE || '/app/allowed_api_keys.txt';
 const DEFAULT_TIMEOUT_MS = process.env.DEFAULT_TIMEOUT_MS ? Number(process.env.DEFAULT_TIMEOUT_MS) : 600000;
 const VERBOSE = process.env.VERBOSE === 'true';
+const LOG_FILE = process.env.LOG_FILE || '/app/logs/logs.jsonl';
+
+function writeLog(entry) {
+  try {
+    const logDir = path.dirname(LOG_FILE);
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true });
+    }
+    fs.appendFileSync(LOG_FILE, JSON.stringify(entry) + '\n');
+  } catch (err) {
+    console.error(`Failed to write log: ${err.message}`);
+  }
+}
 
 if (!OPENAI_API_KEY) {
   console.error('ERROR: OPENAI_API_KEY environment variable is required');
@@ -48,6 +62,10 @@ function chooseHttpModule(urlString) {
 
 function handleProxy(pathname) {
   return async (req, res) => {
+    const timestamp = new Date().toISOString();
+    const requestStartTime = Date.now();
+    let apiKey = null;
+
     try {
       const authorization = req.headers['authorization'];
       if (!authorization) {
@@ -62,6 +80,7 @@ function handleProxy(pathname) {
       }
 
       const providedKey = authMatch[1].trim();
+      apiKey = providedKey;
 
       if (!isKeyAllowed(providedKey)) {
         if (VERBOSE) {
@@ -84,6 +103,10 @@ function handleProxy(pathname) {
       let clientAborted = false;
       const isGetRequest = req.method === 'GET' || req.method === 'HEAD';
       const body = isGetRequest ? null : JSON.stringify(req.body || {});
+
+      let usage = null;
+      let buffer = '';
+      let isStreaming = false;
 
       const upstreamHeaders = {
         'accept': wantsStream ? 'text/event-stream' : (clientAccept || 'application/json'),
@@ -123,22 +146,102 @@ function handleProxy(pathname) {
 
           const contentType = (upstreamRes.headers['content-type'] || '').toString();
           if (contentType.includes('text/event-stream')) {
+            isStreaming = true;
             res.setHeader('content-type', 'text/event-stream; charset=utf-8');
             res.setHeader('cache-control', 'no-cache, no-transform');
             res.setHeader('connection', 'keep-alive');
           }
 
-          upstreamRes.on('data', (chunk) => {
-            if (!clientAborted) {
-              res.write(chunk);
+          function logMetrics() {
+            if (usage) {
+              const requestSeconds = (Date.now() - requestStartTime) / 1000;
+              const tokensPerSecond = usage.completion_tokens && requestSeconds > 0
+                ? Math.round((usage.completion_tokens / requestSeconds) * 100) / 100
+                : null;
+              const logEntry = {
+                apikey: apiKey || null,
+                timestamp: timestamp,
+                request_seconds: requestSeconds,
+                tokens_per_second: tokensPerSecond,
+                usage: usage
+              };
+              writeLog(logEntry);
             }
-          });
+          }
 
-          upstreamRes.on('end', () => {
-            if (!clientAborted) {
-              res.end();
+          if (isStreaming) {
+            function processChunkForLogging(chunk) {
+              buffer += chunk.toString();
+              const lines = buffer.split('\n');
+              buffer = lines.pop() || '';
+
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  const dataStr = line.slice(6);
+                  if (dataStr === '[DONE]') continue;
+                  try {
+                    const data = JSON.parse(dataStr);
+                    if (data.usage) {
+                      usage = data.usage;
+                    }
+                  } catch (e) {
+                  }
+                }
+              }
             }
-          });
+
+            upstreamRes.on('data', (chunk) => {
+              if (!clientAborted) {
+                processChunkForLogging(chunk);
+                res.write(chunk);
+              }
+            });
+
+            upstreamRes.on('end', () => {
+              if (!clientAborted) {
+                if (buffer) {
+                  const remainingLines = buffer.split('\n');
+                  for (const line of remainingLines) {
+                    if (line.startsWith('data: ')) {
+                      const dataStr = line.slice(6);
+                      if (dataStr === '[DONE]') continue;
+                      try {
+                        const data = JSON.parse(dataStr);
+                        if (data.usage) {
+                          usage = data.usage;
+                        }
+                      } catch (e) {
+                      }
+                    }
+                  }
+                }
+                logMetrics();
+                res.end();
+              }
+            });
+          } else {
+            let responseBody = '';
+            upstreamRes.on('data', (chunk) => {
+              if (!clientAborted) {
+                res.write(chunk);
+                responseBody += chunk.toString();
+              }
+            });
+
+            upstreamRes.on('end', () => {
+              if (!clientAborted) {
+                res.end();
+                try {
+                  const parsed = JSON.parse(responseBody);
+                  if (parsed.usage) {
+                    usage = parsed.usage;
+                    logMetrics();
+                  }
+                } catch (e) {
+                }
+              }
+            });
+          }
 
           upstreamRes.on('error', (err) => {
             if (clientAborted) return;
@@ -182,14 +285,14 @@ function handleProxy(pathname) {
           res.end();
         }
       });
-      
+
       req.on('aborted', () => {
         clientAborted = true;
-        try { 
+        try {
           if (!upstreamReq.destroyed) {
             upstreamReq.destroy();
           }
-        } catch {}
+        } catch { }
       });
 
       if (body) {
@@ -208,7 +311,7 @@ app.use('*', (req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.json({ 
+  res.json({
     ok: true
   });
 });
@@ -217,4 +320,3 @@ app.listen(PORT, () => {
   console.log(`OpenAI proxy listening on :${PORT}`);
   console.log(`OpenAI base URL: ${OPENAI_BASE_URL}`);
 });
-
